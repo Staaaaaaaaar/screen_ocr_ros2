@@ -1,0 +1,31 @@
+# 核心依赖（仪表盘 OCR 识别）
+numpy==1.23.5
+pillow==10.0.0
+paddlepaddle==2.6.2
+paddleocr==2.7.0
+opencv-python==4.6.0.66
+protobuf>=3.20.2,<4.0.0
+
+# HTTP API
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+
+# paddleocr 运行时依赖
+shapely==2.0.2
+scikit-image==0.21.0
+imgaug==0.4.0
+pyclipper
+lmdb
+tqdm
+rapidfuzz
+opencv-contrib-python==4.6.0.66
+cython
+lxml
+premailer
+openpyxl
+attrdict
+PyMuPDF==1.20.2
+beautifulsoup4
+fire>=0.3.0
+python-docx

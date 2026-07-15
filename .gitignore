@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+.env
+
+# 运行时输出
+output/
+
+# 模型压缩包（解压后使用 .paddleocr/）
+.paddleocr.zip
+
+# IDE
+.idea/
+.vscode/
+*.swp
