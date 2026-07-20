@@ -115,7 +115,7 @@ ros2 launch screen_ocr pipeline_locator.launch.py \
 | `image_type` | `raw` 或 `compressed` | `raw` |
 | `output_topic` | 识别结果发布话题 | `/pipeline_locator/sensor` |
 | `inference_rate_hz` | 请求识别服务的频率 (Hz) | `2.0` |
-| `output_frame_id` | 输出 `SensorMsg.header.frame_id` | `pipeline_locator` |
+| `output_frame_id` | 输出 `SensorMsg.header.frame_id`；留空则沿用相机图像 | `pipeline_locator` |
 | `api_base_url` | 识别 HTTP 服务地址 | `http://127.0.0.1:8000` |
 | `api_timeout_sec` | HTTP 超时（秒） | `5.0` |
 | `debug` | 识别服务是否保存调试图 | `false` |
@@ -127,7 +127,7 @@ ros2 launch screen_ocr pipeline_locator.launch.py \
 1. 订阅 `image_topic`，缓存最新一帧
 2. 按 `inference_rate_hz` 取最新帧，编码为 JPEG（`compressed` 类型可直接转发 JPEG 字节）
 3. `POST {api_base_url}/v1/recognize` 获取 JSON（扁平字段，见下表）
-4. 转换为 `screen_ocr_msgs/msg/SensorMsg` 并发布
+4. 转换为 `screen_ocr_msgs/msg/SensorMsg` 并发布（`header.stamp` 沿用所识别那一帧相机图像的时间戳）
 
 识别 API 响应示例（`POST /v1/recognize` 成功时直接返回扁平 JSON，无 `success` / `data` 包装）：
 
@@ -163,6 +163,8 @@ bool right_arrow
 
 | SensorMsg 字段 | 识别 API 字段 |
 |----------------|---------------|
+| `header.stamp` | 相机图像 `header.stamp`（非节点当前时间） |
+| `header.frame_id` | `output_frame_id` 参数；留空则沿用相机 |
 | `signal_strength_percent` | `signal_strength_percent` |
 | `signal_strength` | `signal_strength_percent / 100` |
 | `current_milliamps` | `current_milliamps` |

@@ -199,9 +199,10 @@ private:
       return;
     }
 
-    std_msgs::msg::Header output_header;
-    output_header.stamp = now();
-    output_header.frame_id = output_frame_id_.empty() ? header.frame_id : output_frame_id_;
+    std_msgs::msg::Header output_header = header;
+    if (!output_frame_id_.empty()) {
+      output_header.frame_id = output_frame_id_;
+    }
 
     const auto sensor_msg = recognition_to_sensor_msg(recognition.value(), output_header);
     publisher_->publish(sensor_msg);

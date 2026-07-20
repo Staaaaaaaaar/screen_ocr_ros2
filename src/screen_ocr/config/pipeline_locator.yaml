@@ -11,7 +11,7 @@ pipeline_locator_node:
     # 向识别 HTTP 服务发起请求的频率 (Hz)
     inference_rate_hz: 2.0
 
-    # 输出消息 header.frame_id
+    # 输出消息 header.frame_id；留空字符串则沿用相机图像 frame_id
     output_frame_id: "pipeline_locator"
 
     # 识别 HTTP 服务地址（recognition_service 需在 conda 环境单独启动）
