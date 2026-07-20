@@ -24,7 +24,7 @@ def main() -> int:
         "image",
         nargs="?",
         default=str(ROOT_DIR / "examples" / "images" / "image0000001.png"),
-        help="图片路径",
+        help="图片路径（示例集为 image0000001.png ~ image0000047.png）",
     )
     parser.add_argument("--debug", action="store_true", help="保存调试图片到 output/")
     args = parser.parse_args()
@@ -50,10 +50,6 @@ def main() -> int:
     cost_ms = (time.perf_counter() - t0) * 1000
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    if result is None:
-        print(f"识别失败，耗时: {cost_ms:.0f} ms", file=sys.stderr)
-        return 2
-
     print(f"耗时: {cost_ms:.0f} ms", file=sys.stderr)
     return 0
 

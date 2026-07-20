@@ -1,13 +1,12 @@
-# 识别 HTTP 服务
+# 管线仪屏幕识别
 
-本目录包含**管线仪屏幕识别**的全部逻辑，需在 conda 环境 `ocr` 中运行。  
-目录带有 `COLCON_IGNORE`，**不会**被上级 colcon 工作区（[screen_ocr_ros2](../README.md)）编译。
+基于 OpenCV 的**管线探测仪（管线仪）屏幕信息识别**方案，针对固定型号设备的 LCD 界面，从实拍截图中解析仪表读数。
 
-基于 OpenCV 的固定 ROI + 七段 LCD 模板匹配，从实拍截图中解析仪表读数。
+本目录带有 `COLCON_IGNORE`，**不会**被上级 colcon 工作区编译；识别服务需在 conda 环境 `ocr` 中独立运行。
 
 ## 适用设备（占位）
 
-标定配置仅适用于以下型号，部署到其他设备前请重新标定 `config/`（详见 `config/DEVICE.md`）：
+本仓库标定配置仅适用于以下型号，部署到其他设备前请重新标定 `config/`（详见 `config/DEVICE.md`）：
 
 | 项目 | 说明 |
 |------|------|
@@ -20,52 +19,58 @@
 
 ## 识别字段
 
+`POST /v1/recognize` 直接返回以下 **6 个字段**（数值型，`null` 表示该字段未识别）：
+
 | 字段 | 说明 | 示例 |
 |------|------|------|
-| `signal_strength` | 信号强度 | `0.0%` |
-| `pipeline_current` | 管线电流 | `350 mA` |
-| `burial_depth` | 埋设深度 | `140 m` |
-| `compass_angle` | 罗盘角度 | `61°` |
-| `arrow_direction` | 箭头方向 | `none` / `left` / `right` / `both` |
+| `signal_strength_percent` | 信号强度（%） | `5.7` |
+| `current_milliamps` | 管线电流（mA） | `220` |
+| `depth_meters` | 埋设深度（m） | `140` |
+| `pipeline_heading_degrees` | 罗盘/管线方向（°） | `0.0` |
+| `left_arrow` | 左箭头是否亮起 | `false` |
+| `right_arrow` | 右箭头是否亮起 | `false` |
 
 识别流程：
 
-- **数字字段**：七段 LCD 模板匹配（针对该型号屏幕标定）
-- **罗盘指针**：OpenCV 边缘检测 + 霍夫直线
-- **箭头图标**：OpenCV 轮廓检测
+- **数字字段**：七段 LCD 模板匹配（启动时预加载 `assets/digit_templates/`）
+- **罗盘指针**：圆心定位 + 径向边缘采样
+- **箭头图标**：OpenCV 轮廓检测（`arrow_left` / `arrow_right` ROI）
 
-## 目录结构
+技术栈：`opencv-python`（图像处理与模板匹配）
+
+## 仓库结构
 
 ```
 recognition_service/
-├── src/
-│   └── screen_ocr/         # 识别核心库
+├── config/                 # 该型号设备的标定配置
+│   ├── rois.json
+│   ├── compass.json
+│   ├── digit_slots.json
+│   └── DEVICE.md
+├── assets/
+│   └── digit_templates/    # 已标定数字模板
+├── examples/
+│   └── images/             # 示例截图 image0000001.png ~ image0000047.png
 ├── scripts/
 │   ├── recognize.py        # CLI：读图输出 JSON
 │   └── api_server.py       # HTTP API 服务
-├── config/
-│   ├── rois.json           # 各字段 ROI
-│   ├── compass.json        # 罗盘圆心与半径
-│   ├── digit_slots.json    # 七段数码管切片比例
-│   └── DEVICE.md           # 设备型号说明
-├── assets/
-│   └── digit_templates/    # 数字匹配模板
-├── examples/
-│   └── images/             # 示例截图（image0000001.png ~ image0000047.png）
-├── output/                 # 调试输出（--debug 时生成，gitignore）
-├── environment.yml         # conda 环境定义
-├── requirements.txt        # Python 依赖
-├── start_api_server.sh     # 启动脚本
-└── setup.py                # 可选 pip 安装
+├── src/
+│   └── screen_ocr/         # 识别核心库
+├── output/                 # 调试输出（--debug 时生成）
+├── requirements.txt
+├── environment.yml
+├── pyproject.toml
+└── start_api_server.sh     # 启动 HTTP 服务（推荐）
 ```
 
 ## 环境安装
 
+以下命令均在 `recognition_service/` 目录下执行。
+
 ### conda（推荐）
 
-在本目录下执行：
-
 ```bash
+cd recognition_service
 conda env create -f environment.yml   # 环境名: ocr
 conda activate ocr
 ```
@@ -78,19 +83,13 @@ conda activate ocr
 pip install -r requirements.txt
 ```
 
-可选安装识别库：
-
-```bash
-pip install -e .
-```
-
 ## 使用
 
 ### 命令行识别
 
 ```bash
-conda activate ocr
 cd recognition_service
+conda activate ocr
 
 python scripts/recognize.py
 python scripts/recognize.py examples/images/image0000001.png
@@ -102,8 +101,8 @@ python scripts/recognize.py examples/images/image0000001.png --debug
 ### 启动 HTTP 服务
 
 ```bash
-conda activate ocr
 cd recognition_service
+conda activate ocr
 ./start_api_server.sh
 # 或: python scripts/api_server.py
 ```
@@ -124,6 +123,8 @@ cd recognition_service
 | PUT | `/v1/config` | 更新标定配置 |
 | POST | `/v1/recognize` | 上传图片识别（`image` 文件 + 可选 `debug`、`frame_id`） |
 
+`POST /v1/recognize` 成功时返回上述 6 个扁平字段；失败时返回 HTTP 错误（如 `400` 空图/解码失败，`503` 未标定），body 为 FastAPI 标准 `{"detail": "..."}` 格式。
+
 示例：
 
 ```bash
@@ -131,6 +132,17 @@ curl http://127.0.0.1:8000/health
 
 curl -X POST http://127.0.0.1:8000/v1/recognize \
   -F "image=@examples/images/image0000001.png"
+```
+
+`/health` 响应示例：
+
+```json
+{
+  "status": "ok",
+  "model_loaded": true,
+  "runtime": {"ready": true, "templates_loaded": true},
+  "calibrated": true
+}
 ```
 
 ## 配置与换型
@@ -142,25 +154,27 @@ curl -X POST http://127.0.0.1:8000/v1/recognize \
 | `config/digit_slots.json` | 七段数码管切片比例 |
 | `assets/digit_templates/` | 数字匹配模板 |
 
-`assets/digit_templates/` 中，信号强度模板命名为 `0_i.png`、`1_i.png` 这类形式；电流与深度模板命名为 `0.png`、`1.png` 这类形式；小数点模板命名为 `dot.png`。
+`assets/digit_templates/` 中，信号强度模板命名为 `0_i_20.png`、`1_i_30.png` 这类形式（数字 + 可选 `_i` + 变体编号）；电流与深度模板命名为 `0_1.png`、`1_2.png` 或 `0.png`、`1.png` 这类形式；小数点模板命名为 `dot.png`。
 
 更换管线仪型号时：
 
 1. 更新 `config/DEVICE.md` 与上方「适用设备」信息
-2. 重新标定 `config/` 下 JSON 配置文件
+2. 重新标定 `config/` 下配置文件
 3. 重新制作并替换 `assets/digit_templates/` 下的数字模板
 4. 重启 HTTP 服务
 
 ## 输出示例
 
+以 `examples/images/image0000001.png` 为例：
+
 ```json
 {
-  "signal_strength": "0.0%",
-  "pipeline_current": "350 mA",
-  "burial_depth": "140 m",
-  "arrow_direction": "none",
-  "compass_angle": "61°",
-  "compass_angle_deg": 61.0
+  "signal_strength_percent": 5.7,
+  "depth_meters": null,
+  "current_milliamps": 220,
+  "pipeline_heading_degrees": 0.0,
+  "left_arrow": false,
+  "right_arrow": false
 }
 ```
 
@@ -174,7 +188,7 @@ curl -X POST http://127.0.0.1:8000/v1/recognize \
 | fastapi | 0.115.6 |
 | uvicorn | 0.32.1 |
 
-完整列表见 `requirements.txt`。
+完整列表见 `requirements.txt` / `pyproject.toml`。
 
 ## License
 

@@ -126,8 +126,23 @@ ros2 launch screen_ocr pipeline_locator.launch.py \
 
 1. 订阅 `image_topic`，缓存最新一帧
 2. 按 `inference_rate_hz` 取最新帧，编码为 JPEG（`compressed` 类型可直接转发 JPEG 字节）
-3. `POST {api_base_url}/v1/recognize` 获取 JSON
+3. `POST {api_base_url}/v1/recognize` 获取 JSON（扁平字段，见下表）
 4. 转换为 `screen_ocr_msgs/msg/SensorMsg` 并发布
+
+识别 API 响应示例（`POST /v1/recognize` 成功时直接返回扁平 JSON，无 `success` / `data` 包装）：
+
+```json
+{
+  "signal_strength_percent": 5.7,
+  "depth_meters": null,
+  "current_milliamps": 220,
+  "pipeline_heading_degrees": 0.0,
+  "left_arrow": false,
+  "right_arrow": false
+}
+```
+
+请求失败时返回 HTTP 4xx/5xx，body 为 `{"detail": "..."}`。C++ 节点仅在 HTTP 2xx 且 JSON 可解析时发布 `SensorMsg`。
 
 **arm64 建议**：若相机发布 `sensor_msgs/CompressedImage`，设置 `image_type: "compressed"`，可跳过 OpenCV 解码，进一步降低运行时依赖风险。
 
@@ -146,15 +161,15 @@ bool left_arrow
 bool right_arrow
 ```
 
-| SensorMsg 字段 | 来源 |
-|----------------|------|
-| `signal_strength_percent` | 屏幕信号强度读数 |
+| SensorMsg 字段 | 识别 API 字段 |
+|----------------|---------------|
+| `signal_strength_percent` | `signal_strength_percent` |
 | `signal_strength` | `signal_strength_percent / 100` |
-| `current_milliamps` | 管线电流 |
-| `depth_meters` | 埋设深度 |
-| `pipeline_heading_degrees` | 罗盘角度 |
-| `left_arrow` / `right_arrow` | 箭头方向 |
-| `magnetic_field` | 由管线方向角度转换的单位方向向量 |
+| `current_milliamps` | `current_milliamps` |
+| `depth_meters` | `depth_meters` |
+| `pipeline_heading_degrees` | `pipeline_heading_degrees` |
+| `left_arrow` / `right_arrow` | `left_arrow` / `right_arrow` |
+| `magnetic_field` | 由 `pipeline_heading_degrees` 转换的单位方向向量 |
 
 ## 常见问题
 
@@ -164,9 +179,10 @@ bool right_arrow
 | 运行时 `numpy` / `opencv` ABI 报错 | Python 与 ROS 库混用 | 使用 C++ 节点；运行 ROS 时勿 `conda activate` |
 | `Could NOT find nlohmann_json` | 缺少 JSON 库 | `sudo apt install nlohmann-json3-dev` |
 | `Could NOT find CURL` | 缺少 libcurl | `sudo apt install libcurl4-openssl-dev` |
-| `Recognition failed` | 识别服务未启动 | 检查 `curl http://127.0.0.1:8000/health` 与 `api_base_url` |
+| `Recognition failed` | 识别服务未启动或 HTTP/JSON 失败 | 检查 `curl http://127.0.0.1:8000/health` 与 `api_base_url`；确认 `/v1/recognize` 返回 2xx |
 | `Waiting for image` | 无图像话题 | 检查相机节点与 `image_topic` |
 | 识别结果全为 NaN | 标定或图像问题 | 检查 `recognition_service/config/` |
+| CLI 默认图片读取失败 | 未在 `recognition_service/` 下运行或路径错误 | 示例图为 `examples/images/image0000001.png`（`.png`，非 `.jpg`） |
 
 ## License
 

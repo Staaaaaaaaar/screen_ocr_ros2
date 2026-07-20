@@ -12,6 +12,7 @@ import numpy as np
 
 from screen_ocr.digit_reader import (
     ensure_digit_templates,
+    load_digit_templates,
     read_meter_digits,
     read_percent_display,
 )
@@ -29,6 +30,29 @@ def _get_templates(img: np.ndarray, rois: dict) -> dict:
     if _TEMPLATE_CACHE is None:
         _TEMPLATE_CACHE = ensure_digit_templates(img, rois)
     return _TEMPLATE_CACHE
+
+
+def preload_runtime() -> dict[str, bool]:
+    """Preload reusable digit templates for the HTTP process."""
+    global _TEMPLATE_CACHE
+
+    loaded_templates = load_digit_templates()
+    if loaded_templates:
+        _TEMPLATE_CACHE = loaded_templates
+
+    return {
+        "templates_loaded": bool(_TEMPLATE_CACHE),
+    }
+
+
+def reset_template_cache() -> None:
+    global _TEMPLATE_CACHE
+    _TEMPLATE_CACHE = None
+
+
+def reload_runtime() -> dict[str, bool]:
+    reset_template_cache()
+    return preload_runtime()
 
 
 @dataclass
@@ -177,12 +201,206 @@ def point_line_distance(px, py, x1, y1, x2, y2) -> float:
     return abs((y2 - y1) * px - (x2 - x1) * py + x2 * y1 - y2 * x1) / line_len
 
 
+def _locate_compass_geometry(
+    gray: np.ndarray, compass_config: dict
+) -> tuple[int, int, int]:
+    """Locate the compass circle in the current frame before detecting its needle."""
+    configured_cx, configured_cy = compass_config["center"]
+    configured_r = int(compass_config["radius"])
+
+    if not compass_config.get("refine_geometry", True):
+        return int(configured_cx), int(configured_cy), configured_r
+
+    # The hub is near the calibrated center. Searching only this small region
+    # keeps HoughCircles fast while returning the same dynamic center.
+    hub_margin = max(32, int(configured_r * 0.4))
+    x1 = max(0, int(configured_cx - hub_margin))
+    y1 = max(0, int(configured_cy - hub_margin))
+    x2 = min(gray.shape[1], int(configured_cx + hub_margin))
+    y2 = min(gray.shape[0], int(configured_cy + hub_margin))
+    search = gray[y1:y2, x1:x2]
+    if search.size == 0:
+        return int(configured_cx), int(configured_cy), configured_r
+
+    # The small hub remains visible when the outer compass ring is low contrast.
+    hub_blurred = cv2.medianBlur(search, 3)
+    for param2 in (30, 25, 20):
+        hub_circles = cv2.HoughCircles(
+            hub_blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=1.0,
+            minDist=max(20, int(configured_r * 0.23)),
+            param1=80,
+            param2=param2,
+            minRadius=9,
+            maxRadius=28,
+        )
+        if hub_circles is None:
+            continue
+        hub_candidates = []
+        for circle_x, circle_y, _ in hub_circles[0]:
+            absolute_x = float(circle_x + x1)
+            absolute_y = float(circle_y + y1)
+            distance = np.hypot(
+                absolute_x - configured_cx, absolute_y - configured_cy
+            )
+            if distance <= configured_r * 0.6:
+                hub_candidates.append((distance, absolute_x, absolute_y))
+        if hub_candidates:
+            _, center_x, center_y = min(hub_candidates, key=lambda item: item[0])
+            return int(round(center_x)), int(round(center_y)), configured_r
+
+    # Rare low-contrast frames fall back to the wider outer-ring search.
+    search_margin = max(35, int(configured_r * 0.55))
+    x1 = max(0, int(configured_cx - configured_r - search_margin))
+    y1 = max(0, int(configured_cy - configured_r - search_margin))
+    x2 = min(gray.shape[1], int(configured_cx + configured_r + search_margin))
+    y2 = min(gray.shape[0], int(configured_cy + configured_r + search_margin))
+    search = gray[y1:y2, x1:x2]
+    if search.size == 0:
+        return int(configured_cx), int(configured_cy), configured_r
+
+    blurred = cv2.medianBlur(search, 5)
+    candidates: list[tuple[float, float, float, float]] = []
+    for param2 in (25, 21, 17):
+        circles = cv2.HoughCircles(
+            blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=1.0,
+            minDist=max(30, int(configured_r * 0.4)),
+            param1=80,
+            param2=param2,
+            minRadius=max(40, int(configured_r * 0.72)),
+            maxRadius=int(configured_r * 1.3),
+        )
+        if circles is None:
+            continue
+        for circle_x, circle_y, radius in circles[0]:
+            absolute_x = float(circle_x + x1)
+            absolute_y = float(circle_y + y1)
+            center_distance = np.hypot(
+                absolute_x - configured_cx, absolute_y - configured_cy
+            )
+            if center_distance <= configured_r * 0.6:
+                candidates.append(
+                    (
+                        center_distance + abs(float(radius) - configured_r) * 1.5,
+                        absolute_x,
+                        absolute_y,
+                        float(radius),
+                    )
+                )
+
+    if not candidates:
+        return int(configured_cx), int(configured_cy), configured_r
+
+    _, center_x, center_y, radius = min(candidates, key=lambda item: item[0])
+    return int(round(center_x)), int(round(center_y)), int(round(radius))
+
+
+def _estimate_compass_axis(
+    gray: np.ndarray, center_x: int, center_y: int, radius: int
+) -> float | None:
+    """Estimate the needle axis from edge support on both sides of the hub."""
+    x1 = max(0, center_x - radius)
+    y1 = max(0, center_y - radius)
+    x2 = min(gray.shape[1], center_x + radius)
+    y2 = min(gray.shape[0], center_y + radius)
+    compass_gray = gray[y1:y2, x1:x2]
+    if compass_gray.size == 0:
+        return None
+
+    edges = cv2.Canny(cv2.GaussianBlur(compass_gray, (3, 3), 0), 5, 15)
+    local_center_x = center_x - x1
+    local_center_y = center_y - y1
+    distances = np.arange(
+        max(18, int(radius * 0.22)), int(radius * 0.86), dtype=np.float32
+    )
+    offsets = np.arange(-3, 4, dtype=np.float32)
+    angles = np.arange(0.0, 180.0, 0.5, dtype=np.float32)
+    angle_rad = np.deg2rad(angles)
+    unit_x = np.sin(angle_rad)[:, None, None]
+    unit_y = -np.cos(angle_rad)[:, None, None]
+    normal_x = np.cos(angle_rad)[:, None, None]
+    normal_y = np.sin(angle_rad)[:, None, None]
+    distance_grid = distances[None, :, None]
+    offset_grid = offsets[None, None, :]
+
+    def side_support(side: float) -> np.ndarray:
+        sample_x = (
+            local_center_x
+            + side * unit_x * distance_grid
+            + normal_x * offset_grid
+        )
+        sample_y = (
+            local_center_y
+            + side * unit_y * distance_grid
+            + normal_y * offset_grid
+        )
+        sample_x = np.clip(
+            np.rint(sample_x).astype(np.int32),
+            0,
+            edges.shape[1] - 1,
+        )
+        sample_y = np.clip(
+            np.rint(sample_y).astype(np.int32),
+            0,
+            edges.shape[0] - 1,
+        )
+        sampled = edges[sample_y, sample_x]
+        return (sampled.max(axis=2) > 0).sum(axis=1)
+
+    support = np.minimum(side_support(1.0), side_support(-1.0))
+    best_index = int(np.argmax(support))
+    best_support = int(support[best_index])
+    best_angle = float(angles[best_index])
+
+    if best_support < int(radius * 0.46):
+        return None
+
+    angle_rad = np.deg2rad(best_angle)
+    unit_x = np.sin(angle_rad)
+    unit_y = -np.cos(angle_rad)
+    yy, xx = np.nonzero(edges)
+    relative_x = xx.astype(np.float32) - local_center_x
+    relative_y = yy.astype(np.float32) - local_center_y
+    distance_from_center = np.hypot(relative_x, relative_y)
+    distance_from_axis = np.abs(relative_x * unit_y - relative_y * unit_x)
+    line_mask = (
+        (distance_from_center >= distances[0])
+        & (distance_from_center < distances[-1])
+        & (distance_from_axis <= 5.0)
+    )
+    line_points = np.column_stack(
+        [xx[line_mask].astype(np.float32), yy[line_mask].astype(np.float32)]
+    )
+    if len(line_points) >= 10:
+        vx, vy, _, _ = cv2.fitLine(line_points, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+        if vy > 0:
+            vx, vy = -vx, -vy
+        signed_clockwise_angle = np.degrees(np.arctan2(vx, -vy))
+        axis_angle = (
+            signed_clockwise_angle
+            if signed_clockwise_angle >= 0
+            else 180.0 + signed_clockwise_angle
+        )
+        return float(round(axis_angle))
+
+    heading = -best_angle if best_angle <= 90.0 else -(best_angle - 180.0)
+    return float(round(heading))
+
+
 def get_compass_info(img: np.ndarray, compass_config: dict, debug: DebugContext | None = None) -> str:
     debug = debug or DebugContext()
 
     try:
-        cx, cy = compass_config["center"]
-        r = compass_config["radius"]
+        configured_cx, configured_cy = compass_config["center"]
+        configured_r = int(compass_config["radius"])
+        gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cx, cy, r = _locate_compass_geometry(
+            gray_full,
+            {"center": [configured_cx, configured_cy], "radius": configured_r},
+        )
 
         x1 = max(0, cx - r)
         y1 = max(0, cy - r)
@@ -210,6 +428,12 @@ def get_compass_info(img: np.ndarray, compass_config: dict, debug: DebugContext 
             gray,
             debug,
         )
+
+        # The radial axis check uses both needle halves and avoids unrelated Hough lines.
+        heading = _estimate_compass_axis(gray_full, cx, cy, r)
+        if heading is None:
+            return "none"
+        return f"{int(heading)}°"
 
         def find_best_line(
             edge_img: np.ndarray,
@@ -327,6 +551,25 @@ def parse_compass_angle(compass_angle: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
+def parse_display_number(value: str) -> float | None:
+    if not value or value == "none":
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", value)
+    return float(match.group(0)) if match else None
+
+
+def parse_display_integer(value: str) -> int | None:
+    number = parse_display_number(value)
+    return int(number) if number is not None else None
+
+
+def normalize_pipeline_heading(angle: float | None) -> float | None:
+    if angle is None:
+        return None
+    clockwise_angle = angle if angle <= 90 else angle - 180
+    return float(round(-clockwise_angle))
+
+
 def prepare_image(img: np.ndarray) -> np.ndarray:
     """Use the input image directly; ROIs are calibrated on the original frame."""
     return img
@@ -354,17 +597,18 @@ def recognize(
     depth_roi = img[rois["depth"][1] : rois["depth"][3], rois["depth"][0] : rois["depth"][2]]
     depth = ocr_integer_value(depth_roi, "depth", templates)
 
-    arrow = arrow_detect(img, rois["arrow_right"], rois["arrow_left"], debug=debug_ctx)
+    arrow = normalize_arrow(
+        arrow_detect(img, rois["arrow_right"], rois["arrow_left"], debug=debug_ctx)
+    )
     compass_angle = get_compass_info(img, compass, debug=debug_ctx)
 
-    if compass_angle == "none" or intensity == "none":
-        return None
+    heading = normalize_pipeline_heading(parse_compass_angle(compass_angle))
 
     return {
-        "signal_strength": intensity,
-        "pipeline_current": "none" if current == "none" else f"{current} mA",
-        "burial_depth": f"{depth} m",
-        "arrow_direction": normalize_arrow(arrow),
-        "compass_angle": compass_angle,
-        "compass_angle_deg": parse_compass_angle(compass_angle),
+        "signal_strength_percent": parse_display_number(intensity),
+        "depth_meters": parse_display_number(depth),
+        "current_milliamps": parse_display_integer(current),
+        "pipeline_heading_degrees": heading,
+        "left_arrow": arrow in {"left", "both"},
+        "right_arrow": arrow in {"right", "both"},
     }

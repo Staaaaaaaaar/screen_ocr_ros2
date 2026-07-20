@@ -4,10 +4,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cctype>
 #include <memory>
-#include <sstream>
-#include <stdexcept>
+#include <string>
 
 namespace screen_ocr
 {
@@ -30,6 +28,98 @@ std::string trim_trailing_slash(std::string url)
   return url;
 }
 
+std::optional<double> read_optional_number(const nlohmann::json & payload, const char * key)
+{
+  if (!payload.contains(key) || payload[key].is_null()) {
+    return std::nullopt;
+  }
+  if (payload[key].is_number()) {
+    return payload[key].get<double>();
+  }
+  return std::nullopt;
+}
+
+std::optional<RecognitionResult> parse_flat_response(const nlohmann::json & payload)
+{
+  if (!payload.is_object()) {
+    return std::nullopt;
+  }
+
+  if (!payload.contains("signal_strength_percent") &&
+    !payload.contains("current_milliamps") &&
+    !payload.contains("depth_meters") &&
+    !payload.contains("pipeline_heading_degrees"))
+  {
+    return std::nullopt;
+  }
+
+  RecognitionResult result;
+  result.signal_strength_percent = read_optional_number(payload, "signal_strength_percent");
+  result.depth_meters = read_optional_number(payload, "depth_meters");
+  result.current_milliamps = read_optional_number(payload, "current_milliamps");
+  result.pipeline_heading_degrees = read_optional_number(payload, "pipeline_heading_degrees");
+  result.left_arrow = payload.value("left_arrow", false);
+  result.right_arrow = payload.value("right_arrow", false);
+  return result;
+}
+
+std::optional<RecognitionResult> parse_legacy_response(const nlohmann::json & payload)
+{
+  if (!payload.value("success", false) || !payload.contains("data") || !payload["data"].is_object()) {
+    return std::nullopt;
+  }
+
+  const auto & data = payload["data"];
+  RecognitionResult result;
+  result.left_arrow = false;
+  result.right_arrow = false;
+
+  if (data.contains("compass_angle_deg") && data["compass_angle_deg"].is_number()) {
+    result.pipeline_heading_degrees = data["compass_angle_deg"].get<double>();
+  }
+
+  if (data.contains("signal_strength") && data["signal_strength"].is_string()) {
+    const auto text = data["signal_strength"].get<std::string>();
+    if (!text.empty() && text != "none") {
+      try {
+        result.signal_strength_percent = std::stod(text);
+      } catch (const std::exception &) {
+        // Keep optional empty.
+      }
+    }
+  }
+
+  if (data.contains("pipeline_current") && data["pipeline_current"].is_string()) {
+    const auto text = data["pipeline_current"].get<std::string>();
+    if (!text.empty() && text != "none") {
+      try {
+        result.current_milliamps = std::stod(text);
+      } catch (const std::exception &) {
+        // Keep optional empty.
+      }
+    }
+  }
+
+  if (data.contains("burial_depth") && data["burial_depth"].is_string()) {
+    const auto text = data["burial_depth"].get<std::string>();
+    if (!text.empty() && text != "none") {
+      try {
+        result.depth_meters = std::stod(text);
+      } catch (const std::exception &) {
+        // Keep optional empty.
+      }
+    }
+  }
+
+  if (data.contains("arrow_direction") && data["arrow_direction"].is_string()) {
+    const auto direction = data["arrow_direction"].get<std::string>();
+    result.left_arrow = direction == "left" || direction == "both";
+    result.right_arrow = direction == "right" || direction == "both";
+  }
+
+  return result;
+}
+
 std::optional<RecognitionResult> parse_recognition_json(const std::string & body)
 {
   nlohmann::json payload;
@@ -39,29 +129,10 @@ std::optional<RecognitionResult> parse_recognition_json(const std::string & body
     return std::nullopt;
   }
 
-  if (!payload.value("success", false)) {
-    return std::nullopt;
+  if (auto flat = parse_flat_response(payload)) {
+    return flat;
   }
-
-  if (!payload.contains("data") || !payload["data"].is_object()) {
-    return std::nullopt;
-  }
-
-  const auto & data = payload["data"];
-  RecognitionResult result;
-  result.signal_strength = data.value("signal_strength", "");
-  result.pipeline_current = data.value("pipeline_current", "");
-  result.burial_depth = data.value("burial_depth", "");
-  result.arrow_direction = data.value("arrow_direction", "none");
-  result.compass_angle = data.value("compass_angle", "");
-
-  if (data.contains("compass_angle_deg") && !data["compass_angle_deg"].is_null()) {
-    if (data["compass_angle_deg"].is_number()) {
-      result.compass_angle_deg = data["compass_angle_deg"].get<double>();
-    }
-  }
-
-  return result;
+  return parse_legacy_response(payload);
 }
 
 class CurlGlobalInit

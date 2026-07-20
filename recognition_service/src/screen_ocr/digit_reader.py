@@ -54,6 +54,9 @@ _EARLY_INTENSITY_SCORE_THRESHOLD = 0.80
 _OPTIONAL_INTENSITY_ABSENT_SCORE_THRESHOLD = 0.88
 _DIGIT_SLOTS_CACHE: dict[str, Any] | None = None
 _DIGIT_VECTOR_CACHE: dict[tuple[tuple[str, tuple[int, ...]], ...], list[tuple[str, np.ndarray]]] = {}
+_FLAT_DIGIT_VECTOR_CACHE: dict[
+    tuple[tuple[str, tuple[int, ...]], ...], tuple[list[str], np.ndarray]
+] = {}
 _CANDIDATE_BOX_CACHE: dict[tuple[str, str, tuple[float, float, float, float]], list[list[float]]] = {}
 _INTENSITY_PRIORITY_OFFSETS = [
     (-0.04, -0.04, 0.0),
@@ -303,22 +306,18 @@ def _best_digit_match(
     if cell.size == 0:
         return None, -1.0
 
-    norm = _match_vector(_normalize_cell(cell))
+    normalized = _normalize_cell(cell)
+    norm = _match_vector(normalized)
     if norm is None:
         return None, -1.0
 
-    best_digit = None
-    best_score = -1.0
+    labels, matrix = _flat_template_vectors(templates)
+    if not labels:
+        return None, -1.0
 
-    for digit, items in _template_vectors(templates):
-        scores = np.einsum("ij,j->i", items, norm, optimize=False)
-        idx = int(np.argmax(scores))
-        score = float(scores[idx])
-        if score > best_score:
-            best_score = score
-            best_digit = digit
-
-    return best_digit, best_score
+    scores = matrix @ norm
+    best_index = int(np.argmax(scores))
+    return labels[best_index], float(scores[best_index])
 
 
 def _template_vector_key(
@@ -359,6 +358,36 @@ def _template_vectors(templates: dict[str, list[np.ndarray]]) -> list[tuple[str,
     return vectors
 
 
+def _flat_template_vectors(
+    templates: dict[str, list[np.ndarray]],
+) -> tuple[list[str], np.ndarray]:
+    """Flatten template vectors so each cell uses one matrix multiply."""
+    key = _template_vector_key(templates)
+    if key in _FLAT_DIGIT_VECTOR_CACHE:
+        return _FLAT_DIGIT_VECTOR_CACHE[key]
+
+    labels: list[str] = []
+    vectors: list[np.ndarray] = []
+    for digit, digit_vectors in _template_vectors(templates):
+        for vector in digit_vectors:
+            labels.append(digit)
+            vectors.append(vector)
+
+    if vectors:
+        matrix = np.stack(vectors).astype(np.float32, copy=False)
+    else:
+        matrix = np.empty((0, 32 * 48), dtype=np.float32)
+
+    result = (labels, matrix)
+    _FLAT_DIGIT_VECTOR_CACHE[key] = result
+    return result
+
+
+def _ordered_offsets(values: list[float] | tuple[float, ...]) -> list[float]:
+    """Try the calibrated position first, then nearby fallback positions."""
+    return sorted(values, key=lambda value: (abs(float(value)), float(value)))
+
+
 def _match_digit(cell: np.ndarray, templates: dict[str, list[np.ndarray]]) -> str | None:
     best_digit, best_score = _best_digit_match(cell, templates)
     return best_digit if best_score >= _MATCH_THRESHOLD else None
@@ -375,18 +404,8 @@ def _match_digit_slot(
     best_digit, best_score = _best_digit_match(cell, templates)
     best_contrast = _cell_contrast(cell)
 
-    if field == "intensity" and best_score >= _MATCH_THRESHOLD:
-        if slot_name == "d1":
-            if (
-                best_digit == "1"
-                and best_score >= _OPTIONAL_INTENSITY_SCORE_THRESHOLD
-                and best_contrast >= _LOW_CONTRAST_OPTIONAL_THRESHOLD
-            ):
-                return best_digit, best_score, best_contrast
-            if best_digit != "1" and best_score >= _OPTIONAL_INTENSITY_ABSENT_SCORE_THRESHOLD:
-                return best_digit, best_score, best_contrast
-        elif best_score >= _FAST_INTENSITY_SCORE_THRESHOLD:
-            return best_digit, best_score, best_contrast
+    if field == "intensity" and best_score >= _FAST_INTENSITY_SCORE_THRESHOLD:
+        return best_digit, best_score, best_contrast
 
     for candidate in _candidate_boxes(box, field, slot_name):
         if candidate == box:
@@ -463,21 +482,114 @@ def _format_fixed_decimal_before_last(
     return value
 
 
-def _format_fixed_decimal_before_last(
-    digit_values: dict[str, str],
-    allowed_formats: list[str],
+def _read_aligned_integer(
+    roi: np.ndarray,
+    slots: list[dict[str, Any]],
+    templates: dict[str, list[np.ndarray]],
+    config: dict[str, Any],
 ) -> str:
-    digits = "".join(digit_values[key] for key in sorted(digit_values.keys()))
-    if len(digits) < 2:
-        return ""
+    digit_slots = [slot for slot in slots if slot.get("type", "digit") == "digit"]
+    threshold = float(config.get("match_threshold", _MATCH_THRESHOLD))
+    x_offsets = _ordered_offsets(config.get("x_offsets", [0.0]))
+    y_offsets = _ordered_offsets(config.get("y_offsets", [0.0]))
 
-    value = f"{digits[:-1]}.{digits[-1]}"
-    if allowed_formats:
-        value_format = re.sub(r"\d", "D", value)
-        if value_format not in allowed_formats:
+    best_digits: list[str] = []
+    best_score = -1.0
+    best_offset = (0.0, 0.0)
+
+    for dx in x_offsets:
+        for dy in y_offsets:
+            digits: list[str] = []
+            scores: list[float] = []
+
+            for slot in digit_slots:
+                x1, y1, x2, y2 = _slot_to_box(slot)
+                box = [
+                    _clamp_ratio(x1 + dx),
+                    _clamp_ratio(y1 + dy),
+                    _clamp_ratio(x2 + dx),
+                    _clamp_ratio(y2 + dy),
+                ]
+                digit, score = _best_digit_match(_crop_ratio(roi, box), templates)
+                if digit is None or score < threshold:
+                    break
+                digits.append(digit)
+                scores.append(score)
+
+            average_score = sum(scores) / len(scores) if scores else 0.0
+            quality = len(digits) * 2.0 + average_score
+            if quality > best_score:
+                best_digits = digits
+                best_score = quality
+                best_offset = (dx, dy)
+
+    trailing_contrast_threshold = float(config.get("trailing_contrast_threshold", 15.0))
+    dx, dy = best_offset
+    for slot in digit_slots[len(best_digits) :]:
+        x1, y1, x2, y2 = _slot_to_box(slot)
+        box = [
+            _clamp_ratio(x1 + dx),
+            _clamp_ratio(y1 + dy),
+            _clamp_ratio(x2 + dx),
+            _clamp_ratio(y2 + dy),
+        ]
+        if _cell_contrast(_crop_ratio(roi, box)) >= trailing_contrast_threshold:
             return ""
 
-    return value
+    return "".join(best_digits)
+
+
+def _read_aligned_fixed_decimal(
+    roi: np.ndarray,
+    slots: list[dict[str, Any]],
+    templates: dict[str, list[np.ndarray]],
+    config: dict[str, Any],
+) -> str:
+    digit_slots = [slot for slot in slots if slot.get("type", "digit") == "digit"]
+    threshold = float(config.get("match_threshold", _MATCH_THRESHOLD))
+    x_offsets = _ordered_offsets(config.get("x_offsets", [0.0]))
+    y_offsets = _ordered_offsets(config.get("y_offsets", [0.0]))
+    leading_contrast_threshold = float(config.get("leading_contrast_threshold", 15.0))
+    leading_box = _slot_to_box(digit_slots[0])
+    has_leading_digit = _cell_contrast(_crop_ratio(roi, leading_box)) >= leading_contrast_threshold
+    patterns = [digit_slots if has_leading_digit else digit_slots[-2:]]
+
+    best_digits: list[str] = []
+    best_quality = -1.0
+
+    for pattern in patterns:
+        for dx in x_offsets:
+            for dy in y_offsets:
+                digits: list[str] = []
+                scores: list[float] = []
+
+                for slot in pattern:
+                    x1, y1, x2, y2 = _slot_to_box(slot)
+                    box = [
+                        _clamp_ratio(x1 + dx),
+                        _clamp_ratio(y1 + dy),
+                        _clamp_ratio(x2 + dx),
+                        _clamp_ratio(y2 + dy),
+                    ]
+                    digit, score = _best_digit_match(_crop_ratio(roi, box), templates)
+                    if digit is None or score < threshold:
+                        break
+                    digits.append(digit)
+                    scores.append(score)
+
+                if len(digits) != len(pattern):
+                    continue
+
+                quality = sum(scores) / len(scores)
+                if quality > best_quality:
+                    best_digits = digits
+                    best_quality = quality
+
+    if len(best_digits) not in {2, 3}:
+        return ""
+    if best_quality < float(config.get("minimum_average_score", threshold)):
+        return ""
+    return f"{''.join(best_digits[:-1])}.{best_digits[-1]}"
 
 
 def read_meter_digits(
@@ -498,6 +610,11 @@ def read_meter_digits(
     decimal_after = config.get("decimal_after")
 
     roi = roi[: int(roi.shape[0] * top_ratio), :]
+    if config.get("integer_only", False):
+        return _read_aligned_integer(roi, slots, templates, config)
+    if config.get("aligned_fixed_decimal", False):
+        return _read_aligned_fixed_decimal(roi, slots, templates, config)
+
     if slots and isinstance(slots[0], dict):
         digit_values: dict[str, str] = {}
         dot_after: str | None = None
@@ -516,12 +633,6 @@ def read_meter_digits(
                     if required:
                         return ""
                     continue
-                if field == "intensity" and not required:
-                    if digit != "1" or score < _OPTIONAL_INTENSITY_SCORE_THRESHOLD:
-                        continue
-                    if contrast < _LOW_CONTRAST_OPTIONAL_THRESHOLD:
-                        return ""
-
                 digit_values[name] = digit
 
             elif slot_type == "dot":

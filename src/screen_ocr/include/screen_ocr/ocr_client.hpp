@@ -9,12 +9,12 @@ namespace screen_ocr
 
 struct RecognitionResult
 {
-  std::string signal_strength;
-  std::string pipeline_current;
-  std::string burial_depth;
-  std::string arrow_direction;
-  std::string compass_angle;
-  std::optional<double> compass_angle_deg;
+  std::optional<double> signal_strength_percent;
+  std::optional<double> depth_meters;
+  std::optional<double> current_milliamps;
+  std::optional<double> pipeline_heading_degrees;
+  bool left_arrow{false};
+  bool right_arrow{false};
 };
 
 std::optional<RecognitionResult> recognize_image(
