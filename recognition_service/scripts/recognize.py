@@ -26,7 +26,11 @@ def main() -> int:
         default=str(ROOT_DIR / "examples" / "images" / "image0000001.png"),
         help="图片路径（示例集为 image0000001.png ~ image0000047.png）",
     )
-    parser.add_argument("--debug", action="store_true", help="保存调试图片到 output/")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="保存一张带 ROI 标注的调试图到 output/",
+    )
     args = parser.parse_args()
 
     config = load_calib_config()

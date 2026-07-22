@@ -56,7 +56,7 @@ recognition_service/
 │   └── api_server.py       # HTTP API 服务
 ├── src/
 │   └── screen_ocr/         # 识别核心库
-├── output/                 # 调试输出（--debug 时生成）
+├── output/                 # 调试输出（--debug 时生成单张 ROI 标注图）
 ├── requirements.txt
 ├── environment.yml
 ├── pyproject.toml
@@ -96,7 +96,7 @@ python scripts/recognize.py examples/images/image0000001.png
 python scripts/recognize.py examples/images/image0000001.png --debug
 ```
 
-`--debug` 会将中间步骤图片写入 `output/`。
+`--debug` 会在 `output/` 追加保存一张当前帧的 ROI 标注图（含识别结果文字）。
 
 ### 启动 HTTP 服务
 

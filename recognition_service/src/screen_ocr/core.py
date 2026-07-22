@@ -55,33 +55,29 @@ def reload_runtime() -> dict[str, bool]:
     return preload_runtime()
 
 
+_ROI_COLORS: dict[str, tuple[int, int, int]] = {
+    "intensity": (0, 255, 0),
+    "current": (255, 128, 0),
+    "depth": (255, 0, 128),
+    "arrow_left": (0, 255, 255),
+    "arrow_right": (255, 255, 0),
+}
+
+
 @dataclass
 class DebugContext:
     enabled: bool = False
-    ocr_dir: str = ""
-    arrow_dir: str = ""
-    compass_dir: str = ""
-    img_cnt: int = 1
-
-    def reset(self):
-        self.img_cnt = 1
+    output_path: str = ""
 
     def setup(self, tag: str = "api"):
         if not self.enabled:
             return
 
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         ms = int((time.time() * 1000) % 1000)
-        folder_name = f"{timestamp}_{ms}_{tag}"
-
-        self.ocr_dir = str(OUTPUT_DIR / "ocr_preprocess_img" / folder_name)
-        self.arrow_dir = str(OUTPUT_DIR / "debug_arrow" / folder_name)
-        self.compass_dir = str(OUTPUT_DIR / "compass_debug" / folder_name)
-
-        os.makedirs(self.ocr_dir, exist_ok=True)
-        os.makedirs(self.arrow_dir, exist_ok=True)
-        os.makedirs(self.compass_dir, exist_ok=True)
-        self.reset()
+        self.output_path = str(OUTPUT_DIR / f"{timestamp}_{ms}_{tag}.jpg")
 
 
 def load_calib_config() -> dict[str, Any]:
@@ -113,12 +109,83 @@ def is_calibrated(config: dict[str, Any]) -> bool:
     return bool(config.get("rois") and config.get("compass"))
 
 
-def _save_debug_image(path: str, image: np.ndarray, debug: DebugContext) -> None:
-    if debug.enabled and path:
-        cv2.imwrite(path, image)
+def _format_debug_value(result: dict[str, Any], key: str) -> str:
+    value = result.get(key)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
 
 
-def ocr_signal_strength(roi: np.ndarray, templates: dict, debug: DebugContext | None = None) -> str:
+def _draw_roi_overlay(
+    img: np.ndarray,
+    rois: dict,
+    compass: dict,
+    result: dict[str, Any],
+) -> np.ndarray:
+    overlay = img.copy()
+    result_labels = {
+        "intensity": f"signal_strength={_format_debug_value(result, 'signal_strength_percent')}",
+        "current": f"current={_format_debug_value(result, 'current_milliamps')}mA",
+        "depth": f"depth={_format_debug_value(result, 'depth_meters')}m",
+        "arrow_left": f"left={_format_debug_value(result, 'left_arrow')}",
+        "arrow_right": f"right={_format_debug_value(result, 'right_arrow')}",
+    }
+
+    for name, rect in rois.items():
+        x1, y1, x2, y2 = rect
+        color = _ROI_COLORS.get(name, (255, 255, 255))
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+        label = f"{name} {result_labels.get(name, '')}".strip()
+        cv2.putText(
+            overlay,
+            label,
+            (x1, max(y1 - 8, 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    center_x, center_y = compass["center"]
+    radius = int(compass["radius"])
+    compass_color = (255, 0, 255)
+    cv2.circle(overlay, (int(center_x), int(center_y)), radius, compass_color, 2)
+    heading_label = (
+        f"compass heading={_format_debug_value(result, 'pipeline_heading_degrees')}deg"
+    )
+    cv2.putText(
+        overlay,
+        heading_label,
+        (max(int(center_x - radius), 0), max(int(center_y - radius) - 8, 16)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        compass_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    return overlay
+
+
+def _save_debug_overlay(
+    img: np.ndarray,
+    rois: dict,
+    compass: dict,
+    result: dict[str, Any],
+    debug: DebugContext,
+) -> None:
+    if not debug.enabled or not debug.output_path:
+        return
+    overlay = _draw_roi_overlay(img, rois, compass, result)
+    cv2.imwrite(debug.output_path, overlay)
+
+
+def ocr_signal_strength(roi: np.ndarray, templates: dict) -> str:
     value = read_percent_display(roi, templates)
     return value if value else "none"
 
@@ -132,19 +199,10 @@ def arrow_detect(
     img: np.ndarray,
     roi_right: list[int],
     roi_left: list[int],
-    debug: DebugContext | None = None,
 ) -> str:
-    debug = debug or DebugContext()
-
     def detect_arrow_direction(roi: np.ndarray, debug_name: str = "debug") -> str | None:
         if roi is None or roi.size == 0:
             return None
-
-        _save_debug_image(
-            os.path.join(debug.arrow_dir, f"{debug_name}_0_roi.png") if debug.enabled else "",
-            roi,
-            debug,
-        )
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -152,12 +210,6 @@ def arrow_detect(
 
         kernel = np.ones((2, 2), np.uint8)
         morph = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, kernel)
-
-        _save_debug_image(
-            os.path.join(debug.arrow_dir, f"{debug_name}_4_morph.png") if debug.enabled else "",
-            morph,
-            debug,
-        )
 
         contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -390,9 +442,7 @@ def _estimate_compass_axis(
     return float(round(heading))
 
 
-def get_compass_info(img: np.ndarray, compass_config: dict, debug: DebugContext | None = None) -> str:
-    debug = debug or DebugContext()
-
+def get_compass_info(img: np.ndarray, compass_config: dict) -> str:
     try:
         configured_cx, configured_cy = compass_config["center"]
         configured_r = int(compass_config["radius"])
@@ -411,23 +461,11 @@ def get_compass_info(img: np.ndarray, compass_config: dict, debug: DebugContext 
         if roi is None or roi.size == 0:
             return "none"
 
-        _save_debug_image(
-            os.path.join(debug.compass_dir, "1_roi.jpg") if debug.enabled else "",
-            roi,
-            debug,
-        )
-
         roi_cx = cx - x1
         roi_cy = cy - y1
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (3, 3), 0)
-
-        _save_debug_image(
-            os.path.join(debug.compass_dir, "2_gray_img.jpg") if debug.enabled else "",
-            gray,
-            debug,
-        )
 
         # The radial axis check uses both needle halves and avoids unrelated Hough lines.
         heading = _estimate_compass_axis(gray_full, cx, cy, r)
@@ -479,22 +517,12 @@ def get_compass_info(img: np.ndarray, compass_config: dict, debug: DebugContext 
             return best_line
 
         edges = cv2.Canny(gray, 40, 120)
-        _save_debug_image(
-            os.path.join(debug.compass_dir, "3_edges.jpg") if debug.enabled else "",
-            edges,
-            debug,
-        )
 
         best_line = find_best_line(edges, 25, 0.35, 8, 0.25, 0.35)
         if best_line is None:
             enhanced = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4)).apply(gray)
             enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
             enhanced_edges = cv2.Canny(enhanced, 20, 70)
-            _save_debug_image(
-                os.path.join(debug.compass_dir, "3b_enhanced_edges.jpg") if debug.enabled else "",
-                enhanced_edges,
-                debug,
-            )
             best_line = find_best_line(enhanced_edges, 14, 0.25, 12, 0.32, 0.28)
 
         if best_line is None:
@@ -511,22 +539,6 @@ def get_compass_info(img: np.ndarray, compass_config: dict, debug: DebugContext 
         if angle > 180:
             angle -= 180
         angle = round(angle)
-
-        if debug.enabled:
-            final_img = roi.copy()
-            cv2.circle(final_img, (int(roi_cx), int(roi_cy)), 4, (0, 0, 255), -1)
-            cv2.line(
-                final_img,
-                (int(roi_cx), int(roi_cy)),
-                (int(tip_x), int(tip_y)),
-                (0, 255, 0),
-                3,
-            )
-            _save_debug_image(
-                os.path.join(debug.compass_dir, "4_final_perfect_line.jpg"),
-                final_img,
-                debug,
-            )
 
         return f"{angle}°"
     except Exception as e:
@@ -589,7 +601,7 @@ def recognize(
     templates = _get_templates(img, rois)
 
     intensity_roi = img[rois["intensity"][1] : rois["intensity"][3], rois["intensity"][0] : rois["intensity"][2]]
-    intensity = ocr_signal_strength(intensity_roi, templates, debug=debug_ctx)
+    intensity = ocr_signal_strength(intensity_roi, templates)
 
     current_roi = img[rois["current"][1] : rois["current"][3], rois["current"][0] : rois["current"][2]]
     current = ocr_integer_value(current_roi, "current", templates)
@@ -598,13 +610,13 @@ def recognize(
     depth = ocr_integer_value(depth_roi, "depth", templates)
 
     arrow = normalize_arrow(
-        arrow_detect(img, rois["arrow_right"], rois["arrow_left"], debug=debug_ctx)
+        arrow_detect(img, rois["arrow_right"], rois["arrow_left"])
     )
-    compass_angle = get_compass_info(img, compass, debug=debug_ctx)
+    compass_angle = get_compass_info(img, compass)
 
     heading = normalize_pipeline_heading(parse_compass_angle(compass_angle))
 
-    return {
+    result = {
         "signal_strength_percent": parse_display_number(intensity),
         "depth_meters": parse_display_number(depth),
         "current_milliamps": parse_display_integer(current),
@@ -612,3 +624,5 @@ def recognize(
         "left_arrow": arrow in {"left", "both"},
         "right_arrow": arrow in {"right", "both"},
     }
+    _save_debug_overlay(img, rois, compass, result, debug_ctx)
+    return result
